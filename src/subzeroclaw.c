@@ -1,13 +1,16 @@
-/* subzeroclaw.c — skill-driven agentic runtime */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <dirent.h>
+#include <time.h>
+#include <fcntl.h>
 #include <cjson/cJSON.h>
+
+// NEW: Für getcwd (Sandbox CWD)
+#include <limits.h>   // PATH_MAX
 
 #define MAX_PATH   512
 #define MAX_VALUE  1024
@@ -17,6 +20,10 @@ typedef struct {
     char api_key[MAX_VALUE], model[MAX_VALUE], endpoint[MAX_VALUE];
     char skills_dir[MAX_PATH], log_dir[MAX_PATH];
     int  max_turns, max_messages;
+    // NEW: Sandbox-Optionen
+    int sandbox_bwrap;      // 1 = Bubblewrap aktiv (default)
+    int sandbox_net;        // 1 = Netzwerk isolieren (nur localhost, default)
+    int sandbox_timeout;    // Timeout in Sekunden (default 60, 0 = deaktiviert)
 } Config;
 
 static void config_parse_line(Config *cfg, const char *key, const char *val) {
@@ -27,6 +34,10 @@ static void config_parse_line(Config *cfg, const char *key, const char *val) {
     else if (!strcmp(key, "log_dir"))      snprintf(cfg->log_dir,    MAX_PATH,  "%s", val);
     else if (!strcmp(key, "max_turns"))    cfg->max_turns    = atoi(val);
     else if (!strcmp(key, "max_messages")) cfg->max_messages = atoi(val);
+    // NEW: Sandbox-Keys parsen
+    else if (!strcmp(key, "sandbox_bwrap"))   cfg->sandbox_bwrap   = atoi(val);
+    else if (!strcmp(key, "sandbox_net"))     cfg->sandbox_net     = atoi(val);
+    else if (!strcmp(key, "sandbox_timeout")) cfg->sandbox_timeout = atoi(val);
 }
 
 int config_load(Config *cfg) {
@@ -38,6 +49,10 @@ int config_load(Config *cfg) {
     snprintf(cfg->skills_dir, MAX_PATH,  "%s/.subzeroclaw/skills", home);
     snprintf(cfg->log_dir,    MAX_PATH,  "%s/.subzeroclaw/logs", home);
     cfg->max_turns = 200; cfg->max_messages = 40;
+    // NEW: Sandbox-Defaults
+    cfg->sandbox_bwrap   = 1;  // Aktiv
+    cfg->sandbox_net     = 1;  // Netzwerk isolieren (nur localhost)
+    cfg->sandbox_timeout = 60; // 60 Sekunden pro Befehl
 
     char path[MAX_PATH];
     snprintf(path, MAX_PATH, "%s/.subzeroclaw/config", home);
@@ -63,6 +78,10 @@ int config_load(Config *cfg) {
     if ((v = getenv("SUBZEROCLAW_API_KEY")))  snprintf(cfg->api_key,  MAX_VALUE, "%s", v);
     if ((v = getenv("SUBZEROCLAW_MODEL")))    snprintf(cfg->model,    MAX_VALUE, "%s", v);
     if ((v = getenv("SUBZEROCLAW_ENDPOINT"))) snprintf(cfg->endpoint, MAX_VALUE, "%s", v);
+    // NEW: Env-Vars für Sandbox
+    if ((v = getenv("SUBZEROCLAW_SANDBOX_BWRAP")))   cfg->sandbox_bwrap   = atoi(v);
+    if ((v = getenv("SUBZEROCLAW_SANDBOX_NET")))     cfg->sandbox_net     = atoi(v);
+    if ((v = getenv("SUBZEROCLAW_SANDBOX_TIMEOUT"))) cfg->sandbox_timeout = atoi(v);
     if (!cfg->api_key[0]) { fprintf(stderr, "error: no api_key\n"); return -1; }
     return 0;
 }
@@ -123,18 +142,59 @@ static const char TOOLS_JSON[] =
     "\"parameters\":{\"type\":\"object\","
     "\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}}]";
 
-char *tool_execute(const char *name, const char *args_json) {
-    if (strcmp(name, "shell")) return strdup("error: unknown tool");
-    cJSON *args = cJSON_Parse(args_json);
-    cJSON *cmd_item = args ? cJSON_GetObjectItem(args, "command") : NULL;
-    const char *cmd = (cmd_item && cJSON_IsString(cmd_item)) ? cmd_item->valuestring : NULL;
-    if (!cmd) { if (args) cJSON_Delete(args); return strdup("error: missing 'command'"); }
-    size_t len = strlen(cmd);
-    char *full = malloc(len + 8);
-    memcpy(full, cmd, len); memcpy(full + len, " 2>&1", 6);
-    if (args) cJSON_Delete(args);
-    FILE *fp = popen(full, "r"); free(full);
-    if (!fp) return strdup("error: popen failed");
+static char *tool_execute(const Config *cfg, const char *name, cJSON *arguments) {
+    if (strcmp(name, "shell") != 0) return NULL;
+    cJSON *command_json = cJSON_GetObjectItem(arguments, "command");
+    if (!command_json || !cJSON_IsString(command_json)) return strdup("error: missing 'command'");
+    const char *command = command_json->valuestring;
+
+    // NEW: Sandbox mit Bubblewrap + Timeout + optional localhost-only
+    char cmd_buf[8192];
+    if (cfg->sandbox_bwrap) {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            return strdup("Failed to get current working directory for sandbox.");
+        }
+        char timeout_str[32] = "";
+        if (cfg->sandbox_timeout > 0) {
+            snprintf(timeout_str, sizeof(timeout_str), "timeout %d ", cfg->sandbox_timeout);
+        }
+        char net_str[32] = "";
+        if (cfg->sandbox_net) {
+            snprintf(net_str, sizeof(net_str), "--unshare-net ");
+        }
+        snprintf(cmd_buf, sizeof(cmd_buf),
+            "%s bwrap "
+            "--unshare-user-try "
+            "--unshare-pid "
+            "--unshare-ipc "
+            "--unshare-uts "
+            "--unshare-cgroup-try "
+            "--die-with-parent "
+            "--new-session "              // verhindert TIOCSTI-Escape
+            "--tmpfs / "                  // leerer Root
+            "--bind %s /work "            // aktueller Ordner → /work
+            "--chdir /work "              // startet im Arbeitsverzeichnis
+            "--ro-bind /bin /bin "
+            "--ro-bind /usr /usr "
+            "--ro-bind /lib /lib "
+            "--ro-bind /lib64 /lib64 "
+            "--dev /dev "
+            "--proc /proc "
+            "--tmpfs /tmp "
+            "%s "                         // optional: Netzwerk isolieren (nur localhost)
+            "sh -c '%s 2>&1'",
+            timeout_str,
+            cwd,
+            net_str,
+            command);
+    } else {
+        snprintf(cmd_buf, sizeof(cmd_buf), "%s 2>&1", command);
+    }
+
+    FILE *fp = popen(cmd_buf, "r");
+    if (!fp) return strdup("Failed to start bubblewrap sandbox or command.");
+
     char *out = malloc(MAX_OUTPUT);
     size_t total = 0, n;
     while ((n = fread(out + total, 1, MAX_OUTPUT - total - 1, fp)) > 0) {
@@ -231,7 +291,6 @@ static int compact_messages(const Config *cfg, cJSON *msgs, FILE *log) {
     fprintf(stderr, "[compact] %d msgs, summarizing\n", total);
     log_write(log, "SYS", "compacting context");
 
-    /* build text digest — keep user/assistant in full, trim only tool outputs */
     size_t cap = 512000, len = 0;
     char *convo = malloc(cap);
     convo[0] = '\0';
@@ -243,157 +302,166 @@ static int compact_messages(const Config *cfg, cJSON *msgs, FILE *log) {
         if (!role || !cJSON_IsString(role) || !ct || !cJSON_IsString(ct)) continue;
         const char *r = role->valuestring, *c = ct->valuestring;
         size_t clen = strlen(c);
-        if (!strcmp(r, "tool") && clen > 2000) {
-            /* tool outputs: first 1000 + ... + last 1000 */
-            len += snprintf(convo + len, cap - len, "tool: %.*s\n...[%zu bytes trimmed]...\n%s\n",
-                1000, c, clen - 2000, c + clen - 1000);
+        if (strcmp(r, "tool") == 0 && clen > 2000) {
+            // Trim long tool outputs
+            len += snprintf(convo + len, cap - len, "[%s] ", r);
+            if (clen > 1000) {
+                memcpy(convo + len, c, 1000);
+                len += 1000;
+                len += snprintf(convo + len, cap - len, "... [trimmed] ...\n");
+            } else {
+                len += snprintf(convo + len, cap - len, "%s\n", c);
+            }
         } else {
-            len += snprintf(convo + len, cap - len, "%s: %s\n", r, c);
+            len += snprintf(convo + len, cap - len, "[%s] %s\n", r, c);
         }
     }
-    size_t plen = len + 128;
-    char *prompt = malloc(plen);
-    snprintf(prompt, plen, "Summarize this conversation. Keep all facts, file paths, "
-        "commands, and decisions. Be concise.\n\n%s", convo);
+
+    const char *summary_prompt = "Summarize this conversation. Keep all facts, details, and key points. Be concise but complete.";
+    cJSON *sum_msgs = cJSON_CreateArray();
+    cJSON_AddItemToArray(sum_msgs, make_msg("system", summary_prompt));
+    cJSON_AddItemToArray(sum_msgs, make_msg("user", convo));
     free(convo);
 
-    cJSON *sm = cJSON_CreateArray();
-    cJSON_AddItemToArray(sm, make_msg("user", prompt)); free(prompt);
-    char *rj = build_request(cfg, sm, NULL);
-    char *rb = http_post(cfg->endpoint, cfg->api_key, rj);
-    free(rj); cJSON_Delete(sm);
-    if (!rb) return -1;
+    char *req = build_request(cfg, sum_msgs, NULL);
+    cJSON_Delete(sum_msgs);
+    char *resp_body = http_post(cfg->endpoint, cfg->api_key, req);
+    free(req);
+    if (!resp_body) return -1;
 
     Response resp;
-    if (parse_response(rb, &resp) != 0 || !resp.text) { free(rb); response_free(&resp); return -1; }
-    char *summary = strdup(resp.text); free(rb); response_free(&resp);
-    log_write(log, "COMPACT", summary);
-
-    /* keep last ~10 msgs, but skip orphaned tool msgs at the boundary
-       (their tool_call_ids reference deleted assistant msgs → API rejects) */
-    int start = total - 10;
-    if (start < 1) start = 1;
-    while (start < total - 1) {
-        cJSON *r = cJSON_GetObjectItem(cJSON_GetArrayItem(msgs, start), "role");
-        if (!r || strcmp(r->valuestring, "tool") != 0) break;
-        start++;
+    if (parse_response(resp_body, &resp) < 0) {
+        free(resp_body); return -1;
+    }
+    free(resp_body);
+    if (!resp.text) {
+        response_free(&resp); return -1;
     }
 
-    for (int i = start - 1; i >= 1; i--)
-        cJSON_DeleteItemFromArray(msgs, i);
-    cJSON_InsertItemInArray(msgs, 1, make_msg("user", "[Summary of previous context]"));
-    cJSON_InsertItemInArray(msgs, 2, make_msg("assistant", summary));
-    free(summary);
+    // Ersetze alte Nachrichten durch Summary
+    while (cJSON_GetArraySize(msgs) > 10) {  // behalte letzte 10
+        cJSON_DeleteItemFromArray(msgs, 0);
+    }
+    cJSON_InsertItemInArray(msgs, 0, make_msg("assistant", resp.text));
+    cJSON_InsertItemInArray(msgs, 0, make_msg("user", summary_prompt));
+    response_free(&resp);
     return 0;
 }
 
-static void process_tool_calls(cJSON *tool_calls, cJSON *msgs, FILE *log) {
-    cJSON *tc = NULL;
-    cJSON_ArrayForEach(tc, tool_calls) {
-        cJSON *id = cJSON_GetObjectItem(tc, "id");
-        cJSON *fn = cJSON_GetObjectItem(tc, "function");
-        if (!id || !fn) continue;
-        cJSON *name = cJSON_GetObjectItem(fn, "name");
-        cJSON *args = cJSON_GetObjectItem(fn, "arguments");
-        if (!name || !args) continue;
-        log_write(log, "TOOL", name->valuestring);
-        char *result = tool_execute(name->valuestring, args->valuestring);
-        log_write(log, "RES", result ? result : "null");
-        cJSON *tm = cJSON_CreateObject();
-        cJSON_AddStringToObject(tm, "role", "tool");
-        cJSON_AddStringToObject(tm, "tool_call_id", id->valuestring);
-        cJSON_AddStringToObject(tm, "content", result ? result : "error");
-        cJSON_AddItemToArray(msgs, tm);
-        free(result);
+static int process_tool_calls(const Config *cfg, cJSON *tool_calls, cJSON *msgs, FILE *log) {
+    cJSON *call = NULL;
+    cJSON_ArrayForEach(call, tool_calls) {
+        cJSON *func = cJSON_GetObjectItem(call, "function");
+        if (!func) continue;
+        cJSON *name = cJSON_GetObjectItem(func, "name");
+        cJSON *args = cJSON_GetObjectItem(func, "arguments");
+        if (!name || !cJSON_IsString(name) || !args) continue;
+        // NEW: Handle arguments as string (OpenAI format)
+        cJSON *args_parsed = NULL;
+        if (cJSON_IsString(args)) {
+            const char *args_str = args->valuestring;
+            args_parsed = cJSON_Parse(args_str);
+            if (args_parsed) {
+                args = args_parsed;
+            } else {
+                fprintf(stderr, "Failed to parse tool arguments: %s\n", args_str);
+                continue;
+            }
+        } else if (!cJSON_IsObject(args)) {
+            continue;
+        }
+        log_write(log, "TOOL_CALL", name->valuestring);
+        char *result = tool_execute(cfg, name->valuestring, args);
+        if (args_parsed) cJSON_Delete(args_parsed);
+        if (result) {
+            log_write(log, "TOOL_RESULT", result);
+            cJSON *tool_msg = cJSON_CreateObject();
+            cJSON_AddStringToObject(tool_msg, "role", "tool");
+            cJSON_AddStringToObject(tool_msg, "name", name->valuestring);
+            cJSON_AddStringToObject(tool_msg, "content", result);
+            cJSON_AddStringToObject(tool_msg, "tool_call_id", call->child->valuestring);  // id
+            cJSON_AddItemToArray(msgs, tool_msg);
+            free(result);
+        }
     }
+    return 0;
 }
 
-static int agent_run(const Config *cfg, cJSON *msgs, cJSON *tools,
-                     const char *input, FILE *log)
-{
-    cJSON_AddItemToArray(msgs, make_msg("user", input));
-    log_write(log, "USER", input);
+static int agent_run(const Config *cfg, const char *task, FILE *log) {
+    char *system_prompt = agent_build_system_prompt(cfg->skills_dir);
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON_AddItemToArray(msgs, make_msg("system", system_prompt));
+    free(system_prompt);
+    if (task) cJSON_AddItemToArray(msgs, make_msg("user", task));
 
+    cJSON *tools = cJSON_Parse(TOOLS_JSON);
     for (int turn = 1; turn <= cfg->max_turns; turn++) {
-        compact_messages(cfg, msgs, log);
-        char *rj = build_request(cfg, msgs, tools); if (!rj) return -1;
-        fprintf(stderr, "[%d] %s...\n", turn, cfg->model);
-        char *rb = http_post(cfg->endpoint, cfg->api_key, rj); free(rj);
-        if (!rb) return -1;
+        if (compact_messages(cfg, msgs, log) < 0) break;
+
+        char *req = build_request(cfg, msgs, tools);
+        log_write(log, "REQUEST", req);
+        char *resp_body = http_post(cfg->endpoint, cfg->api_key, req);
+        free(req);
+        if (!resp_body) break;
+
         Response resp;
-        if (parse_response(rb, &resp) != 0) { free(rb); return -1; }
-        free(rb);
+        if (parse_response(resp_body, &resp) < 0) { free(resp_body); break; }
+        free(resp_body);
+
+        log_write(log, "RESPONSE", resp.text ? resp.text : "(tool calls)");
         cJSON_AddItemToArray(msgs, resp.msg); resp.msg = NULL;
 
-        if (!strcmp(resp.finish_reason, "stop")) {
-            if (resp.text) { printf("%s\n", resp.text); log_write(log, "ASST", resp.text); }
-            free(resp.finish_reason); return 0;
+        if (strcmp(resp.finish_reason, "stop") == 0) {
+            if (resp.text) printf("%s\n", resp.text);
+            response_free(&resp); break;
+        } else if (strcmp(resp.finish_reason, "tool_calls") == 0) {
+            if (process_tool_calls(cfg, resp.tool_calls, msgs, log) < 0) { response_free(&resp); break; }
         }
-        if (!strcmp(resp.finish_reason, "tool_calls") && resp.tool_calls) {
-            process_tool_calls(resp.tool_calls, msgs, log);
-            free(resp.finish_reason); continue;
-        }
-        if (resp.text) { printf("%s\n", resp.text); log_write(log, "ASST", resp.text); }
-        free(resp.finish_reason); return 0;
+        response_free(&resp);
     }
-    fprintf(stderr, "error: max turns (%d) reached\n", cfg->max_turns);
-    return -1;
+    cJSON_Delete(msgs); cJSON_Delete(tools);
+    return 0;
 }
 
-#ifndef SZC_TEST
 int main(int argc, char **argv) {
-    if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
-        fprintf(stderr, "SubZeroClaw — skill-driven agentic runtime\n"
-            "Usage: subzeroclaw [\"prompt\"]\nConfig: ~/.subzeroclaw/config\n");
-        return 0;
-    }
     Config cfg;
-    if (config_load(&cfg)) return 1;
-    char *sysprompt = agent_build_system_prompt(cfg.skills_dir);
-    if (!sysprompt) return 1;
+    if (config_load(&cfg) < 0) return 1;
 
-    char sid[32] = {0};
-    { FILE *ur = fopen("/dev/urandom", "r");
-      if (ur) { unsigned char b[8];
-          if (fread(b, 1, 8, ur) == 8)
-              snprintf(sid, sizeof(sid), "%02x%02x%02x%02x%02x%02x%02x%02x",
-                  b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-          fclose(ur); }
-      if (!sid[0]) snprintf(sid, sizeof(sid), "%lx%x", (long)time(NULL), getpid()); }
-    mkdirp(cfg.log_dir);
-    char lp[600]; snprintf(lp, sizeof(lp), "%s/%s.txt", cfg.log_dir, sid);
-    FILE *log = fopen(lp, "a");
-    if (log) { time_t now = time(NULL); fprintf(log, "=== %s %s", sid, ctime(&now)); fflush(log); }
+    mkdirp(cfg.skills_dir); mkdirp(cfg.log_dir);
 
-    cJSON *msgs = cJSON_CreateArray();
-    cJSON_AddItemToArray(msgs, make_msg("system", sysprompt));
-    cJSON *tools = cJSON_Parse(TOOLS_JSON);
-    int rc = 0;
-    fprintf(stderr, "subzeroclaw · %s · %s\n", cfg.model, sid);
+    char session_id[17];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        unsigned char buf[8]; read(fd, buf, 8); close(fd);
+        snprintf(session_id, sizeof(session_id), "%02x%02x%02x%02x%02x%02x%02x%02x",
+                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    } else {
+        snprintf(session_id, sizeof(session_id), "%016lx", (unsigned long)time(NULL));
+    }
+
+    char log_path[MAX_PATH];
+    snprintf(log_path, MAX_PATH, "%s/%s.txt", cfg.log_dir, session_id);
+    FILE *log = fopen(log_path, "w");
+    if (log) fprintf(log, "# Session %s\n", session_id);
 
     if (argc > 1) {
-        char input[4096], *p = input, *end = input + sizeof(input) - 1;
-        for (int i = 1; i < argc && p < end; i++) {
-            if (i > 1) *p++ = ' ';
-            size_t l = strlen(argv[i]), a = end - p; if (l > a) l = a;
-            memcpy(p, argv[i], l); p += l;
+        char task[8192]; task[0] = '\0';
+        for (int i = 1; i < argc; i++) {
+            strcat(task, argv[i]); if (i < argc - 1) strcat(task, " ");
         }
-        *p = '\0';
-        rc = agent_run(&cfg, msgs, tools, input, log);
+        agent_run(&cfg, task, log);
     } else {
-        char input[4096];
-        for (;;) {
+        char line[8192];
+        while (1) {
             printf("> "); fflush(stdout);
-            if (!fgets(input, sizeof(input), stdin)) break;
-            size_t len = strlen(input);
-            while (len && strchr("\n\r", input[len - 1])) input[--len] = '\0';
-            if (!len) continue;
-            if (!strcmp(input, "/quit") || !strcmp(input, "/exit")) break;
-            agent_run(&cfg, msgs, tools, input, log); printf("\n");
+            if (!fgets(line, sizeof(line), stdin)) break;
+            size_t len = strlen(line);
+            while (len && line[len-1] == '\n') line[--len] = '\0';
+            if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) break;
+            agent_run(&cfg, line, log);
         }
     }
-    cJSON_Delete(msgs); cJSON_Delete(tools); free(sysprompt);
+
     if (log) fclose(log);
-    return rc;
+    return 0;
 }
-#endif

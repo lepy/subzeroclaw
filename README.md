@@ -6,7 +6,7 @@
 
 > **WARNING: This software executes arbitrary shell commands with no safety checks, no confirmation prompts, no sandboxing, and no guardrails. The LLM decides what to run and the runtime runs it — `rm -rf /` included. There is nothing between the model's output and your system. If you don't understand what that means, do not use this. This is a bare agentic loop: execute the task, whatever it takes, nothing more, nothing less.**
 
-**~380 lines of C. 54KB binary. A skill-driven agentic daemon for edge hardware.**
+**~470 lines of C. 54KB binary. A skill-driven agentic daemon for edge hardware.**
 
 ```
 skill.md + LLM + shell + loop = autonomous agent
@@ -37,7 +37,7 @@ SubZeroClaw doesn't simplify their architecture. It ignores it and writes the lo
 |                   | SubZeroClaw  | ZeroClaw     | OpenClaw     |
 |-------------------|--------------|--------------|--------------|
 | Language          | C            | Rust         | TypeScript   |
-| Source            | ~380 lines   | ~15,000      | ~430,000     |
+| Source            | ~470 lines   | ~15,000      | ~430,000     |
 | Binary            | 54 KB        | 3.4 MB       | 80+ MB       |
 | RAM (runtime)     | ~2 MB        | < 5 MB       | 80-120 MB    |
 | Compiles on Pi    | 0.5s         | OOM          | slow         |
@@ -78,6 +78,43 @@ make install    # copies to ~/.local/bin/
 
 Requires `libcjson-dev` or uses vendored cJSON automatically.
 
+### Sandbox (optional)
+
+SubZeroClaw can sandbox tool execution with [bubblewrap](https://github.com/containers/bubblewrap). Install it:
+
+```bash
+# Debian/Ubuntu
+sudo apt install bubblewrap
+
+# Arch
+sudo pacman -S bubblewrap
+
+# Fedora
+sudo dnf install bubblewrap
+```
+
+Enable in config:
+
+```ini
+[sandbox]
+sandbox_bwrap = 1
+sandbox_net = 0        # 1 = block external network
+sandbox_timeout = 30
+```
+
+**Ubuntu 24.04+:** AppArmor restricts unprivileged user namespaces by default, which breaks bwrap. Fix:
+
+```bash
+sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+To make it permanent:
+
+```bash
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/99-userns.conf
+sudo sysctl --system
+```
+
 ## Setup
 
 ```bash
@@ -85,7 +122,7 @@ mkdir -p ~/.subzeroclaw/skills
 
 cat > ~/.subzeroclaw/config << EOF
 api_key = "sk-or-your-openrouter-key"
-model = "minimax/minimax-m2.5"
+model = "grok-4-1-fast-reasoning"
 EOF
 ```
 
@@ -145,18 +182,21 @@ No vector DB. No embeddings. One API call to compress context.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `api_key` | (required) | OpenRouter API key |
-| `model` | `minimax/minimax-m2.5` | Any OpenAI-compatible model |
-| `endpoint` | `https://openrouter.ai/api/v1/chat/completions` | API endpoint |
+| `model` | `grok-4-1-fast-reasoning` | Any OpenAI-compatible model |
+| `endpoint` | `https://api.x.ai/v1/chat/completions` | API endpoint |
 | `skills_dir` | `~/.subzeroclaw/skills` | Path to skill markdown files |
 | `log_dir` | `~/.subzeroclaw/logs` | Session log directory |
 | `max_turns` | 200 | Max tool-call loops per input |
 | `max_messages` | 40 | Trigger context compaction |
+| `sandbox_bwrap` | 0 | Enable bubblewrap sandbox |
+| `sandbox_net` | 0 | Block external network in sandbox |
+| `sandbox_timeout` | 0 | Timeout per command in seconds (0 = none) |
 
 ## Source
 
 ```
 src/
-├── subzeroclaw.c   ~380 lines  The entire runtime
+├── subzeroclaw.c   ~470 lines  The entire runtime
 ├── test.c                      16 tests
 ├── watchdog.c       50 lines   Crash recovery + backoff
 ├── cJSON.c                     Vendored JSON parser

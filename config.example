@@ -1,8 +1,14 @@
 # SubZeroClaw configuration
 # Copy to ~/.subzeroclaw/config and edit
 
-api_key = "sk-or-your-openrouter-key-here"
-model = "minimax/minimax-m2.5"
-# endpoint = "https://openrouter.ai/api/v1/chat/completions"
-# skills_dir = "~/.subzeroclaw/skills"
-# max_turns = 50
+api_key = "your-api-key-here"
+model = "grok-4-1-fast-reasoning"
+endpoint = "https://api.x.ai/v1/chat/completions"
+skills_dir = "~/.subzeroclaw/skills"
+max_turns = 50
+
+
+[sandbox]
+sandbox_bwrap = 1      # Bubblewrap aktivieren (benötigt: apt install bubblewrap)
+sandbox_net = 0        # Nur localhost erlauben (externes Netzwerk blocken)
+sandbox_timeout = 30   # 30 Sekunden Timeout pro Befehl

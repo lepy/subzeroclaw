@@ -1,1 +1,2 @@
-../cJSON.h
+/* Vendored cJSON wrapper */
+#include "../cJSON.h"
