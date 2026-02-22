@@ -423,6 +423,7 @@ static int agent_run(const Config *cfg, const char *task, FILE *log) {
     return 0;
 }
 
+#ifndef SZC_TEST
 int main(int argc, char **argv) {
     Config cfg;
     if (config_load(&cfg) < 0) return 1;
@@ -465,3 +466,4 @@ int main(int argc, char **argv) {
     if (log) fclose(log);
     return 0;
 }
+#endif

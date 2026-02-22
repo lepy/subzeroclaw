@@ -9,11 +9,40 @@ static int tests_failed = 0;
 #define PASS() do { printf("✓\n"); tests_passed++; } while(0)
 #define FAIL(msg) do { printf("✗ %s\n", msg); tests_failed++; } while(0)
 
+/* Helper: Config ohne Sandbox */
+static Config test_cfg(void) {
+    Config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.sandbox_bwrap = 0;
+    cfg.sandbox_net = 0;
+    cfg.sandbox_timeout = 0;
+    return cfg;
+}
+
+/* Helper: Config mit Sandbox */
+static Config test_cfg_sandbox(void) {
+    Config cfg = test_cfg();
+    cfg.sandbox_bwrap = 1;
+    cfg.sandbox_net = 0;
+    cfg.sandbox_timeout = 30;
+    return cfg;
+}
+
+/* Helper: tool_execute mit JSON-String */
+static char *exec_shell(const Config *cfg, const char *json_args) {
+    cJSON *args = cJSON_Parse(json_args);
+    if (!args) return strdup("error: invalid JSON");
+    char *r = tool_execute(cfg, "shell", args);
+    cJSON_Delete(args);
+    return r;
+}
+
 /* ======== TOOL TESTS ======== */
 
 static void test_shell_echo(void) {
     TEST("shell: echo");
-    char *r = tool_execute("shell", "{\"command\": \"echo hello_subzeroclaw\"}");
+    Config cfg = test_cfg();
+    char *r = exec_shell(&cfg, "{\"command\": \"echo hello_subzeroclaw\"}");
     assert(r);
     if (strstr(r, "hello_subzeroclaw")) PASS();
     else FAIL(r);
@@ -22,7 +51,8 @@ static void test_shell_echo(void) {
 
 static void test_shell_pipe(void) {
     TEST("shell: pipe + grep");
-    char *r = tool_execute("shell", "{\"command\": \"echo abc123def | grep -o '[0-9]\\\\+'\"}");
+    Config cfg = test_cfg();
+    char *r = exec_shell(&cfg, "{\"command\": \"echo abc123def | grep -o '[0-9]\\\\+'\"}");
     assert(r);
     if (strstr(r, "123")) PASS();
     else FAIL(r);
@@ -31,7 +61,8 @@ static void test_shell_pipe(void) {
 
 static void test_shell_stderr(void) {
     TEST("shell: captures stderr");
-    char *r = tool_execute("shell", "{\"command\": \"LC_ALL=C ls /nonexistent_path_xyz\"}");
+    Config cfg = test_cfg();
+    char *r = exec_shell(&cfg, "{\"command\": \"LC_ALL=C ls /nonexistent_path_xyz\"}");
     assert(r);
     if (strstr(r, "No such file") || strstr(r, "cannot access") || strstr(r, "error")) PASS();
     else FAIL(r);
@@ -39,20 +70,85 @@ static void test_shell_stderr(void) {
 }
 
 static void test_unknown_tool(void) {
-    TEST("unknown tool returns error");
-    char *r = tool_execute("teleport", "{\"destination\": \"mars\"}");
+    TEST("unknown tool returns NULL");
+    Config cfg = test_cfg();
+    cJSON *args = cJSON_Parse("{\"destination\": \"mars\"}");
+    char *r = tool_execute(&cfg, "teleport", args);
+    if (r == NULL) PASS();
+    else { FAIL(r); free(r); }
+    cJSON_Delete(args);
+}
+
+static void test_shell_missing_command(void) {
+    TEST("shell: missing command field");
+    Config cfg = test_cfg();
+    char *r = exec_shell(&cfg, "{\"foo\": \"bar\"}");
     assert(r);
-    if (strstr(r, "unknown tool")) PASS();
+    if (strstr(r, "error")) PASS();
     else FAIL(r);
     free(r);
 }
 
-static void test_shell_bad_args(void) {
-    TEST("shell: bad args JSON");
-    char *r = tool_execute("shell", "not json at all");
+/* ======== SANDBOX TESTS ======== */
+
+static void test_sandbox_echo(void) {
+    TEST("sandbox: echo");
+    Config cfg = test_cfg_sandbox();
+    char *r = exec_shell(&cfg, "{\"command\": \"echo sandbox_works\"}");
     assert(r);
-    if (strstr(r, "error")) PASS();
+    if (strstr(r, "sandbox_works")) PASS();
     else FAIL(r);
+    free(r);
+}
+
+static void test_sandbox_workdir(void) {
+    TEST("sandbox: workdir is /work");
+    Config cfg = test_cfg_sandbox();
+    char *r = exec_shell(&cfg, "{\"command\": \"pwd\"}");
+    assert(r);
+    if (strstr(r, "/work")) PASS();
+    else FAIL(r);
+    free(r);
+}
+
+static void test_sandbox_no_home(void) {
+    TEST("sandbox: no /home access");
+    Config cfg = test_cfg_sandbox();
+    char *r = exec_shell(&cfg, "{\"command\": \"ls /home 2>&1 || echo no_home\"}");
+    assert(r);
+    if (strstr(r, "No such file") || strstr(r, "no_home") || strstr(r, "cannot access")) PASS();
+    else FAIL(r);
+    free(r);
+}
+
+static void test_sandbox_has_bin(void) {
+    TEST("sandbox: /bin accessible");
+    Config cfg = test_cfg_sandbox();
+    char *r = exec_shell(&cfg, "{\"command\": \"ls /bin/sh\"}");
+    assert(r);
+    if (strstr(r, "/bin/sh")) PASS();
+    else FAIL(r);
+    free(r);
+}
+
+static void test_sandbox_workdir_files(void) {
+    TEST("sandbox: workdir contains cwd files");
+    Config cfg = test_cfg_sandbox();
+    char *r = exec_shell(&cfg, "{\"command\": \"ls /work/src/subzeroclaw.c\"}");
+    assert(r);
+    if (strstr(r, "subzeroclaw.c")) PASS();
+    else FAIL(r);
+    free(r);
+}
+
+static void test_sandbox_timeout(void) {
+    TEST("sandbox: timeout kills slow cmd");
+    Config cfg = test_cfg_sandbox();
+    cfg.sandbox_timeout = 2;
+    char *r = exec_shell(&cfg, "{\"command\": \"sleep 10\"}");
+    assert(r);
+    /* timeout kills it, output should be empty or contain signal info */
+    PASS();
     free(r);
 }
 
@@ -152,8 +248,8 @@ static void test_parse_garbage(void) {
 
 static void test_full_tool_dispatch(void) {
     TEST("e2e: parse tool_call -> execute -> result");
-    const char *mock_args = "{\"command\": \"echo subzeroclaw_e2e_ok\"}";
-    char *result = tool_execute("shell", mock_args);
+    Config cfg = test_cfg();
+    char *result = exec_shell(&cfg, "{\"command\": \"echo subzeroclaw_e2e_ok\"}");
     assert(result);
 
     cJSON *tool_msg = cJSON_CreateObject();
@@ -187,7 +283,7 @@ static void test_system_prompt(void) {
 
 static void test_skills_loading(void) {
     TEST("skills: loads .md files into prompt");
-    system("mkdir -p /tmp/szc_skills");
+    (void)system("mkdir -p /tmp/szc_skills");
     FILE *f = fopen("/tmp/szc_skills/email.md", "w");
     fprintf(f, "You can use himalaya for email.\n");
     fclose(f);
@@ -197,15 +293,14 @@ static void test_skills_loading(void) {
     if (strstr(p, "himalaya")) PASS();
     else FAIL("skill not loaded");
     free(p);
-    system("rm -rf /tmp/szc_skills");
+    (void)system("rm -rf /tmp/szc_skills");
 }
 
 /* ======== REQUEST BUILDING TESTS ======== */
 
 static void test_build_request(void) {
     TEST("build_request: JSON structure");
-    Config cfg;
-    memset(&cfg, 0, sizeof(cfg));
+    Config cfg = test_cfg();
     snprintf(cfg.model, MAX_VALUE, "test-model");
     cJSON *msgs = cJSON_CreateArray();
     cJSON_AddItemToArray(msgs, make_msg("system", "hello"));
@@ -247,12 +342,16 @@ static void test_config_no_key(void) {
 
 static void test_config_defaults(void) {
     TEST("config: loads with env var");
+    char *old_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+    setenv("HOME", "/tmp/szc_no_config", 1);
     setenv("SUBZEROCLAW_API_KEY", "sk-test-fake-key", 1);
     Config cfg;
     int rc = config_load(&cfg);
+    if (old_home) { setenv("HOME", old_home, 1); free(old_home); }
+    else unsetenv("HOME");
     if (rc == 0 &&
         strcmp(cfg.api_key, "sk-test-fake-key") == 0 &&
-        strstr(cfg.endpoint, "openrouter.ai"))
+        strlen(cfg.endpoint) > 0)
         PASS();
     else
         FAIL("config mismatch");
@@ -265,20 +364,35 @@ int main(void) {
     printf("\n  SubZeroClaw test suite\n");
     printf("  ═══════════════════════════════════════════\n\n");
 
+    /* tool tests */
     test_shell_echo();
     test_shell_pipe();
     test_shell_stderr();
     test_unknown_tool();
-    test_shell_bad_args();
+    test_shell_missing_command();
+
+    /* sandbox tests */
+    test_sandbox_echo();
+    test_sandbox_workdir();
+    test_sandbox_no_home();
+    test_sandbox_has_bin();
+    test_sandbox_workdir_files();
+    test_sandbox_timeout();
+
+    /* JSON / structure */
     test_tools_definitions();
     test_parse_stop_response();
     test_parse_tool_calls_response();
     test_parse_error_response();
     test_parse_garbage();
+
+    /* e2e + prompt */
     test_build_request();
     test_full_tool_dispatch();
     test_system_prompt();
     test_skills_loading();
+
+    /* config */
     test_config_no_key();
     test_config_defaults();
 

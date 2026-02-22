@@ -72,7 +72,7 @@ The skills included in this repo (`skills/`) are just examples to show the forma
 ```bash
 make            # builds subzeroclaw (54KB)
 make watchdog   # builds watchdog (17KB)
-make test       # runs 16 tests
+make test       # runs 22 tests
 make install    # copies to ~/.local/bin/
 ```
 
