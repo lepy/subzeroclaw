@@ -141,6 +141,21 @@ static void test_sandbox_workdir_files(void) {
     free(r);
 }
 
+static void test_sandbox_create_user_skill(void) {
+    TEST("sandbox: create user skill in /work/skills");
+    Config cfg = test_cfg_sandbox();
+    /* skills/ does not exist yet — mkdir + write + read back */
+    char *r = exec_shell(&cfg, "{\"command\": \"mkdir -p /work/skills && "
+        "cat > /work/skills/test.md << 'SKILL'\\n## Test Skill\\nDo the thing.\\nSKILL\\n"
+        "cat /work/skills/test.md\"}");
+    assert(r);
+    int ok = strstr(r, "Test Skill") && strstr(r, "Do the thing");
+    free(r);
+    /* cleanup on host */
+    (void)system("rm -rf skills");
+    if (ok) PASS(); else FAIL("skill not created or not readable");
+}
+
 static void test_sandbox_timeout(void) {
     TEST("sandbox: timeout kills slow cmd");
     Config cfg = test_cfg_sandbox();
@@ -274,7 +289,7 @@ static void test_full_tool_dispatch(void) {
 
 static void test_system_prompt(void) {
     TEST("system prompt builds without crash");
-    char *p = agent_build_system_prompt("/nonexistent_dir");
+    char *p = agent_build_system_prompt("/nonexistent_dir", "/nonexistent_dir");
     assert(p);
     if (strstr(p, "SubZeroClaw")) PASS();
     else FAIL("missing base prompt");
@@ -288,7 +303,7 @@ static void test_skills_loading(void) {
     fprintf(f, "You can use himalaya for email.\n");
     fclose(f);
 
-    char *p = agent_build_system_prompt("/tmp/szc_skills");
+    char *p = agent_build_system_prompt("/tmp/szc_skills", "/nonexistent_dir");
     assert(p);
     if (strstr(p, "himalaya")) PASS();
     else FAIL("skill not loaded");
@@ -377,6 +392,7 @@ int main(void) {
     test_sandbox_no_home();
     test_sandbox_has_bin();
     test_sandbox_workdir_files();
+    test_sandbox_create_user_skill();
     test_sandbox_timeout();
 
     /* JSON / structure */

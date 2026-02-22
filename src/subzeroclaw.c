@@ -11,6 +11,8 @@
 
 // NEW: Für getcwd (Sandbox CWD)
 #include <limits.h>   // PATH_MAX
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #define MAX_PATH   512
 #define MAX_VALUE  1024
@@ -148,13 +150,21 @@ static char *tool_execute(const Config *cfg, const char *name, cJSON *arguments)
     if (!command_json || !cJSON_IsString(command_json)) return strdup("error: missing 'command'");
     const char *command = command_json->valuestring;
 
-    // NEW: Sandbox mit Bubblewrap + Timeout + optional localhost-only
+    // Sandbox mit Bubblewrap + Timeout + optional localhost-only
     char cmd_buf[8192];
     if (cfg->sandbox_bwrap) {
         char cwd[PATH_MAX];
         if (getcwd(cwd, sizeof(cwd)) == NULL) {
             return strdup("Failed to get current working directory for sandbox.");
         }
+        // Befehl in Temp-Datei schreiben (vermeidet Quoting-Probleme)
+        char script_path[PATH_MAX];
+        snprintf(script_path, sizeof(script_path), "%s/.szc_cmd", cwd);
+        FILE *sf = fopen(script_path, "w");
+        if (!sf) return strdup("Failed to create sandbox script.");
+        fprintf(sf, "%s\n", command);
+        fclose(sf);
+
         char timeout_str[32] = "";
         if (cfg->sandbox_timeout > 0) {
             snprintf(timeout_str, sizeof(timeout_str), "timeout %d ", cfg->sandbox_timeout);
@@ -162,6 +172,14 @@ static char *tool_execute(const Config *cfg, const char *name, cJSON *arguments)
         char net_str[32] = "";
         if (cfg->sandbox_net) {
             snprintf(net_str, sizeof(net_str), "--unshare-net ");
+        }
+        char skills_bind[MAX_PATH + 64] = "";
+        if (cfg->skills_dir[0]) {
+            mkdirp(cfg->skills_dir);
+            struct stat sb;
+            if (stat(cfg->skills_dir, &sb) == 0 && S_ISDIR(sb.st_mode))
+                snprintf(skills_bind, sizeof(skills_bind),
+                    "--ro-bind %s /skills ", cfg->skills_dir);
         }
         snprintf(cmd_buf, sizeof(cmd_buf),
             "%s bwrap "
@@ -174,6 +192,7 @@ static char *tool_execute(const Config *cfg, const char *name, cJSON *arguments)
             "--new-session "              // verhindert TIOCSTI-Escape
             "--tmpfs / "                  // leerer Root
             "--bind %s /work "            // aktueller Ordner → /work
+            "%s"                          // system skills read-only (optional)
             "--chdir /work "              // startet im Arbeitsverzeichnis
             "--ro-bind /bin /bin "
             "--ro-bind /usr /usr "
@@ -182,12 +201,12 @@ static char *tool_execute(const Config *cfg, const char *name, cJSON *arguments)
             "--dev /dev "
             "--proc /proc "
             "--tmpfs /tmp "
-            "%s "                         // optional: Netzwerk isolieren (nur localhost)
-            "sh -c '%s 2>&1'",
+            "%s "                         // optional: Netzwerk isolieren
+            "bash /work/.szc_cmd 2>&1",
             timeout_str,
             cwd,
-            net_str,
-            command);
+            skills_bind,
+            net_str);
     } else {
         snprintf(cmd_buf, sizeof(cmd_buf), "%s 2>&1", command);
     }
@@ -201,33 +220,48 @@ static char *tool_execute(const Config *cfg, const char *name, cJSON *arguments)
         total += n; if (total >= MAX_OUTPUT - 1) break;
     }
     out[total] = '\0'; pclose(fp);
+    if (cfg->sandbox_bwrap) {
+        char script_path[PATH_MAX];
+        char cwd2[PATH_MAX];
+        if (getcwd(cwd2, sizeof(cwd2)))
+            { snprintf(script_path, sizeof(script_path), "%s/.szc_cmd", cwd2); unlink(script_path); }
+    }
     return out;
 }
 
-char *agent_build_system_prompt(const char *skills_dir) {
-    size_t cap = 8192;
-    char *prompt = malloc(cap);
-    size_t len = snprintf(prompt, cap,
-        "You are SubZeroClaw, a minimal agentic assistant.\n"
-        "You have one tool: shell. Use it to run any command.\n"
-        "For files, use cat, tee, sed, etc. Be concise. Just do it.\n\n");
-    DIR *d = opendir(skills_dir); if (!d) return prompt;
+static size_t load_skills(char **prompt, size_t len, size_t *cap,
+                          const char *dir, const char *label) {
+    DIR *d = opendir(dir); if (!d) return len;
     struct dirent *entry;
     while ((entry = readdir(d))) {
         size_t nlen = strlen(entry->d_name);
         if (nlen < 4 || strcmp(entry->d_name + nlen - 3, ".md") != 0) continue;
-        char fp[MAX_PATH]; snprintf(fp, MAX_PATH, "%s/%s", skills_dir, entry->d_name);
+        char fp[MAX_PATH]; snprintf(fp, MAX_PATH, "%s/%s", dir, entry->d_name);
         FILE *sf = fopen(fp, "r"); if (!sf) continue;
         fseek(sf, 0, SEEK_END); long sz = ftell(sf); fseek(sf, 0, SEEK_SET);
         char *content = malloc(sz + 1);
         content[fread(content, 1, sz, sf)] = '\0'; fclose(sf);
         size_t clen = strlen(content);
-        while (len + clen + 128 >= cap) { cap *= 2; prompt = realloc(prompt, cap); }
-        len += snprintf(prompt + len, cap - len, "\n--- SKILL: %s ---\n", entry->d_name);
-        memcpy(prompt + len, content, clen); len += clen; prompt[len] = '\0';
+        while (len + clen + 128 >= *cap) { *cap *= 2; *prompt = realloc(*prompt, *cap); }
+        len += snprintf(*prompt + len, *cap - len, "\n--- %s: %s ---\n", label, entry->d_name);
+        memcpy(*prompt + len, content, clen); len += clen; (*prompt)[len] = '\0';
         free(content);
     }
     closedir(d);
+    return len;
+}
+
+char *agent_build_system_prompt(const char *skills_dir, const char *project_skills_dir) {
+    size_t cap = 8192;
+    char *prompt = malloc(cap);
+    size_t len = snprintf(prompt, cap,
+        "You are SubZeroClaw, a minimal agentic assistant.\n"
+        "You have one tool: shell. Use it to run any command.\n"
+        "For files, use cat, tee, sed, etc. Be concise. Just do it.\n"
+        "System skills: /skills/ (read-only). "
+        "Project skills: /work/skills/ (read-write, create and edit freely).\n\n");
+    len = load_skills(&prompt, len, &cap, skills_dir, "SKILL");
+    len = load_skills(&prompt, len, &cap, project_skills_dir, "PROJECT SKILL");
     return prompt;
 }
 
@@ -388,7 +422,12 @@ static int process_tool_calls(const Config *cfg, cJSON *tool_calls, cJSON *msgs,
 }
 
 static int agent_run(const Config *cfg, const char *task, FILE *log) {
-    char *system_prompt = agent_build_system_prompt(cfg->skills_dir);
+    char project_skills[MAX_PATH] = "";
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)))
+        snprintf(project_skills, MAX_PATH, "%s/skills", cwd);
+    if (project_skills[0]) mkdirp(project_skills);
+    char *system_prompt = agent_build_system_prompt(cfg->skills_dir, project_skills);
     cJSON *msgs = cJSON_CreateArray();
     cJSON_AddItemToArray(msgs, make_msg("system", system_prompt));
     free(system_prompt);
@@ -430,15 +469,10 @@ int main(int argc, char **argv) {
 
     mkdirp(cfg.skills_dir); mkdirp(cfg.log_dir);
 
-    char session_id[17];
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        unsigned char buf[8]; read(fd, buf, 8); close(fd);
-        snprintf(session_id, sizeof(session_id), "%02x%02x%02x%02x%02x%02x%02x%02x",
-                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
-    } else {
-        snprintf(session_id, sizeof(session_id), "%016lx", (unsigned long)time(NULL));
-    }
+    char session_id[32];
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    strftime(session_id, sizeof(session_id), "%Y%m%dT%H%M%S", tm);
 
     char log_path[MAX_PATH];
     snprintf(log_path, MAX_PATH, "%s/%s.txt", cfg.log_dir, session_id);
@@ -452,14 +486,13 @@ int main(int argc, char **argv) {
         }
         agent_run(&cfg, task, log);
     } else {
-        char line[8192];
         while (1) {
-            printf("> "); fflush(stdout);
-            if (!fgets(line, sizeof(line), stdin)) break;
-            size_t len = strlen(line);
-            while (len && line[len-1] == '\n') line[--len] = '\0';
-            if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) break;
+            char *line = readline("> ");
+            if (!line) break;
+            if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) { free(line); break; }
+            if (line[0]) add_history(line);
             agent_run(&cfg, line, log);
+            free(line);
         }
     }
 

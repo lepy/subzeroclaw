@@ -21,7 +21,7 @@ You write a skill as a markdown file. You point SubZeroClaw at it. It calls an L
 ```
 ~/.subzeroclaw/skills/monitor.md    ← what the agent knows
 ~/.subzeroclaw/config               ← API key + model
-~/.subzeroclaw/logs/<session>.txt   ← full I/O trace
+~/.subzeroclaw/logs/20260222T153001.txt  ← full I/O trace
 ```
 
 The agent reads the skill into its system prompt, receives input, and autonomously calls tools until the task is complete. When context gets full, it compacts old messages into a summary and keeps going.
@@ -72,11 +72,24 @@ The skills included in this repo (`skills/`) are just examples to show the forma
 ```bash
 make            # builds subzeroclaw (54KB)
 make watchdog   # builds watchdog (17KB)
-make test       # runs 22 tests
+make test       # runs 23 tests
 make install    # copies to ~/.local/bin/
 ```
 
-Requires `libcjson-dev` or uses vendored cJSON automatically.
+### Dependencies
+
+```bash
+# Debian/Ubuntu
+sudo apt install libreadline-dev libcjson-dev
+
+# Arch
+sudo pacman -S readline cjson
+
+# Fedora
+sudo dnf install readline-devel cjson-devel
+```
+
+`libreadline-dev` is required. `libcjson-dev` is optional — vendored cJSON is used automatically if not found.
 
 ### Sandbox (optional)
 
@@ -157,14 +170,14 @@ SUBZEROCLAW_ENDPOINT
 
 ## Session logging
 
-Every session gets a random hex ID. All input, output, tool calls, and results are logged to `~/.subzeroclaw/logs/<session>.txt` with timestamps.
+Every session gets a timestamped log file. All input, output, tool calls, and results are logged to `~/.subzeroclaw/logs/`.
 
 ```
-=== f850c58ddd4ae72a Sun Feb 16 16:30:01 2026
-[2026-02-16 16:30:01] USER: check disk usage
-[2026-02-16 16:30:03] TOOL: shell
-[2026-02-16 16:30:03] RES: /dev/sda1  72% /
-[2026-02-16 16:30:04] ASST: Disk usage is at 72%, below threshold.
+=== 20260216T163001 Sun Feb 16 16:30:01 2026
+[20260216T163001] USER: check disk usage
+[20260216T163003] TOOL: shell
+[20260216T163003] RES: /dev/sda1  72% /
+[20260216T163004] ASST: Disk usage is at 72%, below threshold.
 ```
 
 ## Context compaction

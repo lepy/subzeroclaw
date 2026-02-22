@@ -5,11 +5,11 @@ TARGET  = subzeroclaw
 # Use system libcjson if available, otherwise use vendored copy
 HAVE_SYSTEM_CJSON := $(shell pkg-config --exists libcjson 2>/dev/null && echo yes)
 ifeq ($(HAVE_SYSTEM_CJSON),yes)
-  LDFLAGS = -lcjson
+  LDFLAGS = -lcjson -lreadline
 else
   CFLAGS  += -Isrc
   VENDOR  = src/cJSON.c
-  LDFLAGS = -lm
+  LDFLAGS = -lm -lreadline
 endif
 
 # Single-file build (default)
